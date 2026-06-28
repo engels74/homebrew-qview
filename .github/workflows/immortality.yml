@@ -1,0 +1,21 @@
+name: immortality
+
+on:
+  schedule:
+    # run once a month on the first day of the month at 02:00 UTC
+    - cron: "0 2 1 * *"
+  workflow_dispatch: {}
+
+jobs:
+  keepalive:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Keep workflow alive
+        env:
+          GITHUB_TOKEN: ${{ secrets.PERSONAL_TOKEN }}
+          REPOS:        ${{ github.repository }}
+        run: |
+          bash ./gh-workflow-immortality.sh

@@ -1,0 +1,407 @@
+name: Update Cask
+
+on:
+  schedule:
+    - cron: "0 */6 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: update-cask
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      updated: ${{ steps.check.outputs.needed }}
+      new_version: ${{ steps.upstream.outputs.new_version }}
+    steps:
+      - name: Checkout tap repo
+        uses: actions/checkout@v6
+
+      - name: Get latest upstream release info
+        id: upstream
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          # Get the latest release from jurplel/qView. A missing upstream release is
+          # non-fatal, but unexpected API failures should fail loudly.
+          HTTP_STATUS=$(curl -sSL --retry 5 --retry-all-errors --retry-max-time 120 \
+            -w "%{http_code}" \
+            -o release.json \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/jurplel/qView/releases/latest")
+
+          if [ "$HTTP_STATUS" = "404" ]; then
+            echo "No upstream release found."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [ "$HTTP_STATUS" -lt 200 ] || [ "$HTTP_STATUS" -ge 300 ]; then
+            echo "GitHub API returned HTTP ${HTTP_STATUS} while fetching latest upstream release." >&2
+            cat release.json >&2 || true
+            exit 1
+          fi
+
+          RELEASE_JSON=$(cat release.json)
+          TAG_NAME=$(printf '%s' "$RELEASE_JSON" | jq -r '.tag_name')
+
+          if [ -z "$TAG_NAME" ] || [ "$TAG_NAME" = "null" ]; then
+            echo "Latest release payload did not include a tag_name." >&2
+            cat release.json >&2 || true
+            exit 1
+          fi
+
+          # Only accept normal qView version tags (e.g. "7.1" or "7.1.1"). This prevents
+          # untrusted upstream release metadata from becoming shell syntax in later steps.
+          if ! [[ "$TAG_NAME" =~ ^v?[0-9]+\.[0-9]+(\.[0-9]+)?$ ]]; then
+            echo "Unexpected upstream tag format: ${TAG_NAME}" >&2
+            exit 1
+          fi
+
+          NEW_VERSION="${TAG_NAME#v}"
+          EXPECTED_DMG_NAME="qView-${NEW_VERSION}.dmg"
+
+          # qView publishes a macOS DMG named like qView-7.1.dmg. Match it exactly so we
+          # never fall back to a different asset (e.g. the smaller qView-<ver>-legacy.dmg
+          # or a non-macOS build), which could silently publish the wrong package.
+          DMG_URL=$(printf '%s' "$RELEASE_JSON" | jq -r --arg name "$EXPECTED_DMG_NAME" \
+            '.assets[] | select(.name == $name) | .browser_download_url' | head -n 1)
+
+          if [ -z "$DMG_URL" ] || [ "$DMG_URL" = "null" ]; then
+            echo "Expected DMG asset ${EXPECTED_DMG_NAME} not found in upstream release ${TAG_NAME}." >&2
+            echo "Available assets:" >&2
+            printf '%s' "$RELEASE_JSON" | jq -r '.assets[].name' >&2
+            exit 1
+          fi
+
+          EXPECTED_DMG_URL="https://github.com/jurplel/qView/releases/download/${TAG_NAME}/${EXPECTED_DMG_NAME}"
+          if [ "$DMG_URL" != "$EXPECTED_DMG_URL" ]; then
+            echo "Unexpected DMG download URL: ${DMG_URL}" >&2
+            echo "Expected: ${EXPECTED_DMG_URL}" >&2
+            exit 1
+          fi
+
+          DMG_ASSET="qView-${NEW_VERSION}.dmg"
+
+          echo "tag_name=${TAG_NAME}" >> "$GITHUB_OUTPUT"
+          echo "dmg_url=${DMG_URL}" >> "$GITHUB_OUTPUT"
+          echo "dmg_filename=${EXPECTED_DMG_NAME}" >> "$GITHUB_OUTPUT"
+          echo "dmg_asset=${DMG_ASSET}" >> "$GITHUB_OUTPUT"
+          echo "new_version=${NEW_VERSION}" >> "$GITHUB_OUTPUT"
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+
+          echo "Upstream tag: ${TAG_NAME}"
+          echo "Cask version: ${NEW_VERSION}"
+          echo "Upstream DMG: ${EXPECTED_DMG_NAME}"
+          echo "Release asset: ${DMG_ASSET}"
+
+      - name: Check if update is needed
+        id: check
+        if: steps.upstream.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          NEW_VERSION: ${{ steps.upstream.outputs.new_version }}
+          DMG_ASSET: ${{ steps.upstream.outputs.dmg_asset }}
+        run: |
+          set -euo pipefail
+
+          # Extract current version from cask file.
+          CURRENT_VERSION=$(grep -E '^\s*version\s+"' Casks/qview.rb | sed 's/.*"\(.*\)".*/\1/')
+
+          echo "Current cask version: ${CURRENT_VERSION}"
+          echo "New upstream version: ${NEW_VERSION}"
+          echo "Expected rolling release asset: ${DMG_ASSET}"
+
+          echo "previous_version=${CURRENT_VERSION}" >> "$GITHUB_OUTPUT"
+
+          ROLLING_RELEASE_EXISTS=false
+          ROLLING_ASSET_EXISTS=false
+
+          if gh release view latest --json assets > latest-release.json 2>/dev/null; then
+            ROLLING_RELEASE_EXISTS=true
+            echo "Rolling latest release exists."
+
+            if jq -e --arg name "$DMG_ASSET" '.assets[]? | select(.name == $name)' latest-release.json >/dev/null; then
+              ROLLING_ASSET_EXISTS=true
+              echo "Rolling latest release contains ${DMG_ASSET}."
+            else
+              echo "Rolling latest release is missing ${DMG_ASSET}."
+            fi
+          else
+            echo "Rolling latest release is missing."
+          fi
+
+          echo "rolling_release_exists=${ROLLING_RELEASE_EXISTS}" >> "$GITHUB_OUTPUT"
+          echo "rolling_asset_exists=${ROLLING_ASSET_EXISTS}" >> "$GITHUB_OUTPUT"
+
+          if [ "$CURRENT_VERSION" != "$NEW_VERSION" ]; then
+            echo "Update needed: cask version changed."
+            echo "needed=true" >> "$GITHUB_OUTPUT"
+          elif [ "$ROLLING_RELEASE_EXISTS" != "true" ]; then
+            echo "Update needed: rolling release is missing."
+            echo "needed=true" >> "$GITHUB_OUTPUT"
+          elif [ "$ROLLING_ASSET_EXISTS" != "true" ]; then
+            echo "Update needed: rolling release asset is missing."
+            echo "needed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "Cask is already up to date."
+            echo "needed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Download DMG from upstream release
+        if: steps.upstream.outputs.skip != 'true' && steps.check.outputs.needed == 'true'
+        env:
+          DMG_URL: ${{ steps.upstream.outputs.dmg_url }}
+          DMG_ASSET: ${{ steps.upstream.outputs.dmg_asset }}
+        run: |
+          set -euo pipefail
+
+          echo "Downloading DMG from upstream release..."
+          curl -fsSL --retry 5 --retry-all-errors --retry-max-time 300 -o "$DMG_ASSET" "$DMG_URL"
+
+          echo "DMG downloaded successfully."
+          ls -la "$DMG_ASSET"
+
+      - name: Compute SHA256
+        id: sha
+        if: steps.upstream.outputs.skip != 'true' && steps.check.outputs.needed == 'true'
+        env:
+          DMG_ASSET: ${{ steps.upstream.outputs.dmg_asset }}
+        run: |
+          set -euo pipefail
+
+          SHA256=$(sha256sum "$DMG_ASSET" | awk '{print $1}')
+          echo "sha256=${SHA256}" >> "$GITHUB_OUTPUT"
+          echo "SHA256: ${SHA256}"
+
+      - name: Upload DMG artifact
+        if: steps.upstream.outputs.skip != 'true' && steps.check.outputs.needed == 'true'
+        uses: actions/upload-artifact@v7
+        with:
+          name: qView-DMG
+          path: ${{ steps.upstream.outputs.dmg_asset }}
+          retention-days: 1
+
+      - name: Prepare rolling release notes
+        if: steps.upstream.outputs.skip != 'true' && steps.check.outputs.needed == 'true'
+        env:
+          TAG_NAME: ${{ steps.upstream.outputs.tag_name }}
+          NEW_VERSION: ${{ steps.upstream.outputs.new_version }}
+          PREV_VERSION: ${{ steps.check.outputs.previous_version }}
+          DMG_ASSET: ${{ steps.upstream.outputs.dmg_asset }}
+        run: |
+          set -euo pipefail
+
+          BUILD_TIMESTAMP="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+          # Build the changes section.
+          if [ -n "$PREV_VERSION" ] && [ "$PREV_VERSION" != "$NEW_VERSION" ] && [ "$PREV_VERSION" != "PLACEHOLDER" ]; then
+            CHANGES_SECTION="### Changes
+
+          [View release notes on upstream repo](https://github.com/jurplel/qView/releases/tag/${TAG_NAME})"
+          else
+            CHANGES_SECTION="### Changes
+
+          _First tracked release — no previous version to compare._"
+          fi
+
+          # Compose the release body.
+          RELEASE_BODY="## qView — Rolling Release
+
+          This is an automatically maintained rolling release. The attached DMG always reflects the latest release from the upstream [qView](https://github.com/jurplel/qView) repository.
+
+          ---
+
+          ### Build Information
+
+          | Field | Value |
+          |-------|-------|
+          | **Version** | \`${NEW_VERSION}\` |
+          | **Upstream Release** | [\`${TAG_NAME}\`](https://github.com/jurplel/qView/releases/tag/${TAG_NAME}) |
+          | **Build Timestamp** | \`${BUILD_TIMESTAMP}\` |
+          | **Asset** | \`${DMG_ASSET}\` |
+
+          ${CHANGES_SECTION}
+
+          ---
+
+          ### Installation
+
+          \`\`\`bash
+          brew tap engels74/qview
+          brew install --cask qview
+          \`\`\`"
+
+          # Persist the composed release notes for the upload step
+          printf '%s' "$RELEASE_BODY" > "${RUNNER_TEMP}/release-notes.md"
+
+      - name: Upload DMG to rolling release
+        if: steps.upstream.outputs.skip != 'true' && steps.check.outputs.needed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          NEW_VERSION: ${{ steps.upstream.outputs.new_version }}
+          DMG_ASSET: ${{ steps.upstream.outputs.dmg_asset }}
+          ROLLING_ASSET_EXISTS: ${{ steps.check.outputs.rolling_asset_exists }}
+        uses: nick-fields/retry@v4
+        with:
+          timeout_minutes: 10
+          max_attempts: 4
+          retry_wait_seconds: 20
+          command: |
+            set -euo pipefail
+
+            if gh release view latest >/dev/null 2>&1; then
+              if [ "$ROLLING_ASSET_EXISTS" = "true" ]; then
+                echo "Rolling release already contains ${DMG_ASSET}; leaving existing asset in place."
+              else
+                gh release upload latest "$DMG_ASSET" --clobber
+              fi
+
+              gh release edit latest \
+                --title "qView (latest)" \
+                --notes-file "${RUNNER_TEMP}/release-notes.md"
+            else
+              gh release create latest "$DMG_ASSET" \
+                --title "qView (latest)" \
+                --notes-file "${RUNNER_TEMP}/release-notes.md" \
+                --latest=false
+            fi
+
+            # Verify that the versioned cask URL will resolve after this step.
+            if ! gh release view latest --json assets --jq '.assets[].name' | grep -Fx "$DMG_ASSET" >/dev/null; then
+              echo "Rolling latest release does not contain expected asset ${DMG_ASSET} after upload." >&2
+              exit 1
+            fi
+
+            echo "Rolling release updated for version: ${NEW_VERSION}"
+
+      - name: Update cask file
+        if: steps.upstream.outputs.skip != 'true' && steps.check.outputs.needed == 'true'
+        env:
+          NEW_VERSION: ${{ steps.upstream.outputs.new_version }}
+          NEW_SHA256: ${{ steps.sha.outputs.sha256 }}
+        run: |
+          set -euo pipefail
+
+          echo "Updating cask to version ${NEW_VERSION} with SHA256 ${NEW_SHA256}"
+
+          sed -i "s/^\(  version \)\".*\"/\1\"${NEW_VERSION}\"/" Casks/qview.rb
+          sed -i "s/^\(  sha256 \)\".*\"/\1\"${NEW_SHA256}\"/" Casks/qview.rb
+
+          echo "Updated cask file:"
+          cat Casks/qview.rb
+
+      - name: Commit and push
+        if: steps.upstream.outputs.skip != 'true' && steps.check.outputs.needed == 'true'
+        env:
+          NEW_VERSION: ${{ steps.upstream.outputs.new_version }}
+        run: |
+          set -euo pipefail
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add Casks/qview.rb
+          if git diff --cached --quiet; then
+            echo "No cask file changes to commit."
+          else
+            git commit -m "Update qView to ${NEW_VERSION}"
+            git push
+          fi
+
+  virustotal-scan:
+    name: VirusTotal Scan
+    needs: update
+    runs-on: ubuntu-latest
+    if: needs.update.outputs.updated == 'true'
+    permissions:
+      contents: write
+
+    steps:
+      - name: Check VirusTotal configuration
+        id: vt_config
+        env:
+          VT_API_KEY: ${{ secrets.VT_API_KEY }}
+        run: |
+          if [ -z "${VT_API_KEY:-}" ]; then
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "VT_API_KEY is not configured; skipping VirusTotal scan."
+          else
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Download DMG artifact
+        if: steps.vt_config.outputs.enabled == 'true'
+        uses: actions/download-artifact@v8
+        with:
+          name: qView-DMG
+
+      - name: Scan with VirusTotal
+        if: steps.vt_config.outputs.enabled == 'true'
+        uses: crazy-max/ghaction-virustotal@v5
+        id: virustotal
+        with:
+          vt_api_key: ${{ secrets.VT_API_KEY }}
+          request_rate: 4
+          files: |
+            *.dmg
+
+      - name: Create scan results summary
+        if: steps.vt_config.outputs.enabled == 'true'
+        env:
+          VIRUSTOTAL_ANALYSIS: ${{ steps.virustotal.outputs.analysis }}
+        run: |
+          {
+            echo "### VirusTotal Scan Results"
+            echo ""
+            echo "**Scan completed:** $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+            echo ""
+            echo "| File | Report |"
+            echo "|------|--------|"
+            IFS=',' read -ra PAIRS <<< "${VIRUSTOTAL_ANALYSIS}"
+            for pair in "${PAIRS[@]}"; do
+              filename="${pair%%=*}"
+              url="${pair#*=}"
+              echo "| \`${filename}\` | [View VirusTotal Report](${url}) |"
+            done
+            echo ""
+            echo "---"
+            echo ""
+            echo "_Scanned and released automatically by the [update-cask workflow](https://github.com/engels74/homebrew-qview/actions/workflows/update-cask.yml)._"
+          } | tee virustotal-results.md >> $GITHUB_STEP_SUMMARY
+
+      - name: Append VirusTotal results to release notes
+        if: steps.vt_config.outputs.enabled == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        uses: nick-fields/retry@v4
+        with:
+          timeout_minutes: 5
+          max_attempts: 4
+          retry_wait_seconds: 20
+          command: |
+            set -euo pipefail
+
+            # Fetch current release body.
+            gh release view latest --json body --jq '.body' > current-body.md
+
+            # Combine current body with VirusTotal results.
+            {
+              cat current-body.md
+              echo ""
+              echo "---"
+              echo ""
+              cat virustotal-results.md
+            } > updated-body.md
+
+            # Update the release.
+            gh release edit latest --notes-file updated-body.md
+            echo "VirusTotal results appended to release notes"
