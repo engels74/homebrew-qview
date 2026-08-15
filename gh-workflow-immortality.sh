@@ -5,10 +5,10 @@
 # Copyright (C) 2022-2025  Daniel Rudolf <www.daniel-rudolf.de>
 #
 # This work is licensed under the terms of the MIT license.
-# For a copy, see THIRD_PARTY_NOTICES.md or <https://opensource.org/licenses/MIT>.
+# For a copy, see LICENSE file or <https://opensource.org/licenses/MIT>.
 #
 # SPDX-License-Identifier: MIT
-# License-Filename: THIRD_PARTY_NOTICES.md
+# License-Filename: LICENSE
 
 VERSION="1.1.1"
 BUILD="20250304"
@@ -277,7 +277,7 @@ while [ $# -gt 0 ]; do
             echo
             echo "Copyright (C) 2022-2025  Daniel Rudolf"
             echo "This work is licensed under the terms of the MIT license."
-            echo "For a copy, see THIRD_PARTY_NOTICES.md or <https://opensource.org/licenses/MIT>."
+            echo "For a copy, see LICENSE file or <https://opensource.org/licenses/MIT>."
             echo
             echo "Written by Daniel Rudolf <https://www.daniel-rudolf.de/>"
             echo "See also: <https://github.com/PhrozenByte/gh-workflow-immortality>"
